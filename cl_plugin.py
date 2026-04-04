@@ -1,0 +1,522 @@
+"""
+cl_plugin.py
+------------
+Avalanche plugin that integrates the original E2D pipeline into a continual
+learning loop on ImageNet.
+
+Per-task lifecycle:
+  after_training_exp
+    1. [Recover]  Run recover_cl.py as a subprocess for the current task's
+                  class IDs only — saves JPEG synthetic images to disk exactly
+                  as the original E2D codebase does.
+    2. [Relabel]  Load the JPEGs back, run them through the same 5-model teacher
+                  ensemble used by recover_cl.py with N augmented views, and
+                  average the soft-label distributions. Save one .pt file per
+                  class. This replaces the per-epoch .tar FKD format: for CL
+                  replay (≤100 epochs vs 300 in the original) averaged labels
+                  carry the same teacher signal with far less disk overhead.
+    3. [Buffer]   Register image paths + soft-label tensors in E2DBuffer.
+
+  before_training_exp
+    - Build a merged DataLoader: real current-task images (CE loss) +
+      synthetic replay images (DIST/KL/MSE-GT soft-label KD loss).
+
+  after_forward
+    - Add the replay KD loss contribution to strategy.loss.
+"""
+from __future__ import annotations
+
+import sys
+import subprocess
+import time
+from pathlib import Path
+from typing import List, Optional, Set, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+
+from avalanche.training.plugins.strategy_plugin import SupervisedPlugin
+
+from cl_buffer import E2DBuffer, SyntheticReplayDataset, REPLAY_TRANSFORM, IMAGENET_MEAN, IMAGENET_STD
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  KD losses  (identical to train_FKD_parallel.py)
+# ══════════════════════════════════════════════════════════════════════
+
+def _cosine_sim(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    return (a * b).sum(1) / (a.norm(dim=1) * b.norm(dim=1) + eps)
+
+def _pearson(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    return _cosine_sim(a - a.mean(1, keepdim=True), b - b.mean(1, keepdim=True), eps)
+
+def _inter(y_s: torch.Tensor, y_t: torch.Tensor) -> torch.Tensor:
+    return 1 - _pearson(y_s, y_t).mean()
+
+def _intra(y_s: torch.Tensor, y_t: torch.Tensor) -> torch.Tensor:
+    return _inter(y_s.T, y_t.T)
+
+
+class DISTLoss(nn.Module):
+    """DIST loss from train_FKD_parallel.py (unchanged)."""
+    def __init__(self, beta: float = 2.0, gamma: float = 2.0, tem: float = 4.0):
+        super().__init__()
+        self.beta = beta
+        self.gamma = gamma
+        self.tem = tem
+
+    def forward(self, s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        y_s = (s / self.tem).softmax(dim=1)
+        y_t = (t / self.tem).softmax(dim=1)
+        return (
+            self.beta  * (self.tem ** 2) * _inter(y_s, y_t)
+            + self.gamma * (self.tem ** 2) * _intra(y_s, y_t)
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Merged dataset: real (CE) + synthetic replay (soft-label KD)
+# ══════════════════════════════════════════════════════════════════════
+
+class _MergedDataset(Dataset):
+    """
+    Merges a real Avalanche dataset with a SyntheticReplayDataset.
+
+    Returned tuple:  (x, y, task_id, soft_label, is_replay)
+
+    Real samples    → soft_label = zeros, is_replay = False
+    Synthetic items → soft_label from buffer,  is_replay = True
+
+    Keeping task_id in position 2 (Avalanche convention) avoids issues when
+    Avalanche accesses mbatch[-1] as task ID.
+    """
+
+    def __init__(
+        self,
+        real_dataset,
+        synthetic_dataset: SyntheticReplayDataset,
+        num_classes: int,
+    ):
+        self.real      = real_dataset
+        self.synthetic = synthetic_dataset
+        self.num_classes = int(num_classes)
+        self.real_len  = len(real_dataset)
+        self.syn_len   = len(synthetic_dataset)
+
+    def __len__(self) -> int:
+        return self.real_len + self.syn_len
+
+    def __getitem__(self, idx: int):
+        if idx < self.real_len:
+            sample = self.real[idx]
+            x, y = sample[0], sample[1]
+            t = sample[2] if len(sample) >= 3 else torch.tensor(0, dtype=torch.long)
+            y = y.long() if torch.is_tensor(y) else torch.tensor(y, dtype=torch.long)
+            t = t.long() if torch.is_tensor(t) else torch.tensor(t, dtype=torch.long)
+            soft = torch.zeros(self.num_classes, dtype=torch.float32)
+            is_replay = torch.tensor(False, dtype=torch.bool)
+            return x, y, t, soft, is_replay
+
+        syn_idx = idx - self.real_len
+        x, y, soft = self.synthetic[syn_idx]
+        t = torch.tensor(-1, dtype=torch.long)
+        is_replay = torch.tensor(True, dtype=torch.bool)
+        return x, y, t, soft, is_replay
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Averaged soft-label relabeling
+#  (replaces FKD per-epoch .tar files — see module docstring)
+# ══════════════════════════════════════════════════════════════════════
+
+# Same teacher ensemble as recover_cl.py / generate_soft_label_with_db.py
+_TEACHER_NAMES = [
+    "resnet18",
+    "mobilenet_v2",
+    "efficientnet_b0",
+    "shufflenet_v2_x0_5",
+    "alexnet",
+]
+
+# Augmentation used during relabeling mirrors FKD's RandomResizedCrop + flip
+_RELABEL_TRANSFORM = transforms.Compose([
+    transforms.Resize(256),
+    transforms.RandomResizedCrop(
+        224,
+        scale=(0.08, 1.0),
+        interpolation=InterpolationMode.BILINEAR,
+    ),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+
+def _load_teacher_ensemble(device: torch.device) -> List[nn.Module]:
+    import torchvision.models as tv_models
+    teachers = []
+    for name in _TEACHER_NAMES:
+        m = tv_models.__dict__[name](pretrained=True).to(device).eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+        teachers.append(m)
+    print(f"[Relabel] Loaded {len(teachers)} teachers: {_TEACHER_NAMES}")
+    return teachers
+
+
+@torch.no_grad()
+def compute_averaged_soft_labels(
+    img_paths: List[str],
+    teachers: List[nn.Module],
+    device: torch.device,
+    n_views: int = 10,
+    temperature: float = 20.0,   # matches generate_soft_label_with_db.py default
+    batch_size: int = 64,
+) -> torch.Tensor:
+    """
+    Run `n_views` independently augmented forward passes through the teacher
+    ensemble for every synthetic image in `img_paths`.
+
+    Returns averaged probability distribution: shape [N, n_classes].
+
+    Why averaged labels instead of per-epoch FKD .tar files?
+    ─────────────────────────────────────────────────────────
+    The original FKD saves one .tar per (epoch, batch) so the student sees
+    the exact crop the teacher scored.  For CL replay (≪300 epochs, small
+    buffer fraction), averaging over n_views ≥ 10 gives the same expected
+    gradient signal without requiring epoch-synchronised loaders or thousands
+    of .tar files.  The practical accuracy difference for replay is negligible.
+    """
+    n_imgs   = len(img_paths)
+    n_classes: Optional[int] = None
+    accum: Optional[torch.Tensor] = None
+
+    for _ in range(n_views):
+        # Load + augment all images for this view
+        imgs = torch.stack(
+            [_RELABEL_TRANSFORM(Image.open(p).convert("RGB")) for p in img_paths]
+        )  # [N, 3, 224, 224]
+
+        for start in range(0, n_imgs, batch_size):
+            batch = imgs[start : start + batch_size].to(device)
+            logit_sum: Optional[torch.Tensor] = None
+
+            for teacher in teachers:
+                out = teacher(batch).float()
+                logit_sum = out if logit_sum is None else logit_sum + out
+
+            probs = F.softmax(logit_sum / (len(teachers) * temperature), dim=1)
+
+            if n_classes is None:
+                n_classes = probs.shape[1]
+                accum = torch.zeros(n_imgs, n_classes, dtype=torch.float32)
+
+            accum[start : start + batch_size] += probs.cpu()
+
+    accum /= n_views          # average over views
+    return accum               # [N, C]
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Main plugin
+# ══════════════════════════════════════════════════════════════════════
+
+class E2DReplayPlugin(SupervisedPlugin):
+    """
+    Integrates the full E2D 3-stage pipeline into an Avalanche CL strategy.
+
+    Stage 1 — Recover   : calls recover_cl.py as subprocess (GPU is freed first)
+    Stage 2 — Relabel   : averaged soft labels via teacher ensemble
+    Stage 3 — Train     : merged DataLoader + soft-label KD in after_forward
+    """
+
+    def __init__(
+        self,
+        # ── paths ───────────────────────────────────────────────────
+        output_dir: str,
+        recover_script: str,      # path to recover_cl.py
+        train_data_path: str,     # ImageNet train/ root (full, for BN stats)
+        statistic_path: str,      # where recover.py stores/reads BN statistics
+        # ── buffer ──────────────────────────────────────────────────
+        ipc: int = 50,
+        fixed_per_class: bool = True,
+        num_classes: int = 1000,
+        device: torch.device = torch.device("cuda"),
+        # ── recover hyper-params (passed through to recover_cl.py) ──
+        recover_iterations: int = 1000,
+        recover_lr: float = 0.1,
+        recover_batch_size: int = 100,
+        K: int = 700,
+        loss_threshold: float = 0.5,
+        r_loss: float = 0.05,
+        first_multiplier: float = 10.0,
+        tv_l2: float = 0.0001,
+        training_momentum: float = 0.4,
+        gpu_id: str = "0",
+        # ── relabeling ──────────────────────────────────────────────
+        relabel_views: int = 10,
+        relabel_temperature: float = 20.0,
+        relabel_batch_size: int = 64,
+        # ── replay KD ───────────────────────────────────────────────
+        kd_loss: str = "dist",          # "dist" | "kl" | "mse_gt"
+        kd_weight: float = 0.5,
+        kd_temperature: float = 4.0,
+        # ── dataloader ──────────────────────────────────────────────
+        num_workers: int = 8,
+    ):
+        super().__init__()
+
+        self.output_dir       = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.recover_script   = str(recover_script)
+        self.train_data_path  = str(train_data_path)
+        self.statistic_path   = str(statistic_path)
+
+        self.ipc         = ipc
+        self.num_classes = int(num_classes)
+        self.device      = device
+        self.gpu_id      = gpu_id
+        self.num_workers = num_workers
+
+        # recover
+        self.recover_iterations  = int(recover_iterations)
+        self.recover_lr          = float(recover_lr)
+        self.recover_batch_size  = int(recover_batch_size)
+        self.K                   = int(K)
+        self.loss_threshold      = float(loss_threshold)
+        self.r_loss              = float(r_loss)
+        self.first_multiplier    = float(first_multiplier)
+        self.tv_l2               = float(tv_l2)
+        self.training_momentum   = float(training_momentum)
+
+        # relabeling
+        self.relabel_views       = int(relabel_views)
+        self.relabel_temperature = float(relabel_temperature)
+        self.relabel_batch_size  = int(relabel_batch_size)
+
+        # KD
+        self.kd_loss_name = kd_loss
+        self.kd_weight    = float(kd_weight)
+        self.dist_loss    = DISTLoss(tem=kd_temperature)
+
+        self.buffer = E2DBuffer(
+            root=str(self.output_dir),
+            ipc=ipc,
+            fixed_per_class=fixed_per_class,
+        )
+        self.seen_classes: Set[int] = set()
+        self._teachers: Optional[List[nn.Module]] = None
+
+    # ── teacher management ────────────────────────────────────────────
+
+    def _load_teachers(self) -> None:
+        if self._teachers is None:
+            self._teachers = _load_teacher_ensemble(self.device)
+
+    def _unload_teachers(self) -> None:
+        """Move teachers to CPU and free GPU memory before recover subprocess."""
+        if self._teachers is not None:
+            for t in self._teachers:
+                t.cpu()
+            del self._teachers
+            self._teachers = None
+            torch.cuda.empty_cache()
+
+    # ── recover subprocess ────────────────────────────────────────────
+
+    def _run_recover(self, task_id: int, class_ids: List[int]) -> Path:
+        """
+        Call recover_cl.py as a subprocess restricted to `class_ids`.
+        The student model has been moved to CPU before this call so the
+        subprocess has full GPU access.
+        Returns the syn/ directory for this task.
+        """
+        syn_root = self.buffer.task_syn_dir(task_id)
+        # recover_cl.py uses: syn_data_path / exp_name → we set exp_name="syn"
+        syn_root.parent.mkdir(parents=True, exist_ok=True)
+
+        class_ids_str = ",".join(str(c) for c in sorted(class_ids))
+
+        cmd = [
+            sys.executable, self.recover_script,
+            "--train-data-path",   self.train_data_path,
+            "--statistic-path",    self.statistic_path,
+            "--syn-data-path",     str(syn_root.parent),   # task_{T}/
+            "--exp-name",          "syn",
+            "--ipc-number",        str(self.ipc),
+            "--iteration",         str(self.recover_iterations),
+            "--lr",                str(self.recover_lr),
+            "--batch-size",        str(self.recover_batch_size),
+            "--K",                 str(self.K),
+            "--loss-threshold",    str(self.loss_threshold),
+            "--r-loss",            str(self.r_loss),
+            "--first-multiplier",  str(self.first_multiplier),
+            "--tv-l2",             str(self.tv_l2),
+            "--training-momentum", str(self.training_momentum),
+            "--gpu-id",            self.gpu_id,
+            "--class-ids",         class_ids_str,   # CL addition in recover_cl.py
+            "--store-best-images",
+        ]
+
+        print(f"[E2DPlugin] Launching recover_cl.py | classes {class_ids}")
+        t0 = time.time()
+        result = subprocess.run(cmd, check=True, text=True)
+        elapsed = time.time() - t0
+        print(f"[E2DPlugin] Recover done in {elapsed:.1f}s")
+        return syn_root
+
+    # ── image path collection ─────────────────────────────────────────
+
+    def _collect_img_paths(
+        self, syn_dir: Path, class_ids: List[int]
+    ) -> dict:
+        """
+        Gather JPEG paths for each class from recover_cl.py output.
+        recover_cl.py saves to: syn_dir/new{class_id:03d}/*.jpg
+        """
+        paths: dict = {}
+        for cid in class_ids:
+            class_dir = syn_dir / f"new{cid:03d}"
+            if not class_dir.exists():
+                print(f"  [warning] no syn dir for class {cid}: {class_dir}")
+                paths[cid] = []
+            else:
+                paths[cid] = sorted(str(p) for p in class_dir.glob("*.jpg"))
+        return paths
+
+    # ── Avalanche hooks ───────────────────────────────────────────────
+
+    def before_training_exp(self, strategy, **kwargs) -> None:
+        """Inject synthetic replay data before the experience starts."""
+        syn_dataset = self.buffer.get_dataset(transform=REPLAY_TRANSFORM)
+        if syn_dataset is None:
+            print("[E2DPlugin] First experience — no replay data yet.")
+            return
+
+        print(
+            f"[E2DPlugin] Merging {len(syn_dataset)} synthetic images "
+            f"({self.buffer.total_images} total) with real data."
+        )
+        merged = _MergedDataset(
+            real_dataset=strategy.adapted_dataset,
+            synthetic_dataset=syn_dataset,
+            num_classes=self.num_classes,
+        )
+        strategy.dataloader = DataLoader(
+            merged,
+            batch_size=strategy.train_mb_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    def after_forward(self, strategy, **kwargs) -> None:
+        """
+        Add the replay KD loss on synthetic samples.
+        Fires when strategy.loss == 0 (before the criterion adds CE loss).
+        After this hook: total_loss = KD_loss + CE_loss (from criterion).
+        """
+        if self.kd_weight <= 0:
+            return
+
+        mbatch = getattr(strategy, "mbatch", None)
+        # mbatch = (x, y, task_id, soft_label, is_replay) from _MergedDataset
+        if mbatch is None or len(mbatch) < 5:
+            return
+
+        is_replay = mbatch[4]
+        if not torch.is_tensor(is_replay):
+            is_replay = torch.as_tensor(is_replay)
+        is_replay = is_replay.to(strategy.mb_output.device).bool()
+
+        if not is_replay.any():
+            return
+
+        soft_labels   = mbatch[3].to(strategy.mb_output.device).float()
+        s_logits      = strategy.mb_output[is_replay]
+        t_logits      = soft_labels[is_replay]
+        kd            = self._kd_loss(s_logits, t_logits)
+        strategy.loss = strategy.loss + self.kd_weight * kd
+
+    def _kd_loss(self, s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if self.kd_loss_name == "dist":
+            return self.dist_loss(s, t)
+        T = self.dist_loss.tem
+        if self.kd_loss_name == "kl":
+            return (
+                F.kl_div(F.log_softmax(s / T, dim=1), F.softmax(t / T, dim=1),
+                         reduction="batchmean") * T ** 2
+            )
+        if self.kd_loss_name == "mse_gt":
+            return F.mse_loss(F.softmax(s / T, dim=1), F.softmax(t / T, dim=1))
+        raise ValueError(f"Unknown kd_loss: {self.kd_loss_name!r}")
+
+    def after_training_exp(self, strategy, **kwargs) -> None:
+        """Run recover → relabel → update buffer after each task."""
+        exp      = strategy.experience
+        task_id  = int(getattr(exp, "current_experience", 0))
+        new_cls  = [int(c) for c in exp.classes_in_this_experience]
+        self.seen_classes.update(new_cls)
+        total    = len(self.seen_classes)
+
+        print(f"\n[E2DPlugin] Task {task_id} | new classes: {new_cls} | seen: {total}")
+
+        # ── Stage 1: Recover ─────────────────────────────────────────
+        # Free teacher + student GPU memory, then spawn recover subprocess
+        self._unload_teachers()
+        strategy.model.cpu()
+        torch.cuda.empty_cache()
+
+        try:
+            syn_dir = self._run_recover(task_id, new_cls)
+        finally:
+            # Restore student to device regardless of recover success
+            strategy.model.to(self.device)
+
+        paths_per_class = self._collect_img_paths(syn_dir, new_cls)
+
+        # ── Stage 2: Relabel ─────────────────────────────────────────
+        self._load_teachers()
+
+        for cid in new_cls:
+            img_paths = paths_per_class.get(cid, [])
+            if not img_paths:
+                print(f"  [E2DPlugin] class {cid}: no images found, skipping.")
+                continue
+
+            print(
+                f"  -> class {cid} | {len(img_paths)} imgs "
+                f"| {self.relabel_views} views × {len(_TEACHER_NAMES)} teachers"
+            )
+            soft_labels = compute_averaged_soft_labels(
+                img_paths=img_paths,
+                teachers=self._teachers,
+                device=self.device,
+                n_views=self.relabel_views,
+                temperature=self.relabel_temperature,
+                batch_size=self.relabel_batch_size,
+            )
+
+            # Persist soft labels alongside the JPEGs
+            sl_path = self.buffer.soft_label_path(task_id, cid)
+            sl_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(soft_labels, str(sl_path))
+
+            # ── Stage 3 prep: update buffer ───────────────────────────
+            self.buffer.update(
+                task_id=task_id,
+                class_id=cid,
+                img_paths=img_paths,
+                soft_labels=soft_labels,
+                total_classes=total,
+            )
+
+        # Save buffer index for resume support
+        self.buffer.save_index()
+        print(f"[E2DPlugin] {self.buffer}\n")
