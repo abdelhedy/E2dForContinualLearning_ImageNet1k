@@ -148,10 +148,14 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
             ]))
 
     if not load_tag:
-        # BN statistics must be computed from the FULL training set (all 1000
-        # classes) so that teacher hook distributions match what the teachers
-        # expect — this is independent of which task classes we are recovering.
-        train_dataset = torchvision.datasets.ImageFolder(
+        # ── CL CHANGE: compute BN stats only from the current task's classes ──
+        # In a genuine CL setting the full dataset is not available.
+        # We filter ImageFolder to `class_ids` so only the task-visible images
+        # are used. Stats are saved to a per-task subdirectory (statistic_path
+        # already points to task_{T}/statistic/ via the plugin).
+        class_id_set = set(class_ids)
+
+        full_dataset = torchvision.datasets.ImageFolder(
             root=args.train_data_path,
             transform=transforms.Compose([
                 transforms.RandomResizedCrop(224),
@@ -160,14 +164,24 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225]),
             ]))
+
+        # Keep only samples whose class index is in the current task
+        task_indices = [
+            i for i, (_, lbl) in enumerate(full_dataset.samples)
+            if lbl in class_id_set
+        ]
+        task_subset = torch.utils.data.Subset(full_dataset, task_indices)
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, num_workers=4, batch_size=256,
+            task_subset, num_workers=4, batch_size=256,
             drop_last=False, shuffle=True)
+
+        print(f"Computing BN stats on {len(task_subset)} images "
+              f"from {len(class_ids)} task classes (CL-compliant).")
 
         with torch.no_grad():
             for j, _mt in enumerate(model_teacher):
                 if not load_tag_dict[j]:
-                    print(f"Computing BN stats for teacher '{args.aux_teacher[j]}'")
+                    print(f"  Teacher '{args.aux_teacher[j]}'")
                     for i, (data, targets) in tqdm(enumerate(train_loader)):
                         data    = data.cuda(gpu)
                         targets = targets.cuda(gpu)
@@ -178,7 +192,7 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
                         layer.save()
         print("BN statistics saved.")
     else:
-        print("BN statistics loaded from cache.")
+        print("BN statistics loaded from cache (task-local).")
 
     for j in range(len(loss_r_feature_layers)):
         for layer in loss_r_feature_layers[j]:

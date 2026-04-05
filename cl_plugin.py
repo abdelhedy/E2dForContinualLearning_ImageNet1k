@@ -240,8 +240,7 @@ class E2DReplayPlugin(SupervisedPlugin):
         # ── paths ───────────────────────────────────────────────────
         output_dir: str,
         recover_script: str,      # path to recover_cl.py
-        train_data_path: str,     # ImageNet train/ root (full, for BN stats)
-        statistic_path: str,      # where recover.py stores/reads BN statistics
+        train_data_path: str,     # ImageNet train/ root (task-filtered for BN stats)
         # ── buffer ──────────────────────────────────────────────────
         ipc: int = 50,
         fixed_per_class: bool = True,
@@ -275,7 +274,6 @@ class E2DReplayPlugin(SupervisedPlugin):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.recover_script   = str(recover_script)
         self.train_data_path  = str(train_data_path)
-        self.statistic_path   = str(statistic_path)
 
         self.ipc         = ipc
         self.num_classes = int(num_classes)
@@ -342,11 +340,15 @@ class E2DReplayPlugin(SupervisedPlugin):
 
         class_ids_str = ",".join(str(c) for c in sorted(class_ids))
 
+        # Each task gets its own statistic subdirectory so BN stats computed
+        # from task T's data don't overwrite or pollute task T+1's stats.
+        task_statistic_path = str(self.output_dir / f"task_{task_id}" / "statistic")
+
         cmd = [
             sys.executable, self.recover_script,
             "--train-data-path",   self.train_data_path,
-            "--statistic-path",    self.statistic_path,
-            "--syn-data-path",     str(syn_root.parent),   # task_{T}/
+            "--statistic-path",    task_statistic_path,   # per-task, CL-compliant
+            "--syn-data-path",     str(syn_root.parent),  # task_{T}/
             "--exp-name",          "syn",
             "--ipc-number",        str(self.ipc),
             "--iteration",         str(self.recover_iterations),
@@ -359,7 +361,7 @@ class E2DReplayPlugin(SupervisedPlugin):
             "--tv-l2",             str(self.tv_l2),
             "--training-momentum", str(self.training_momentum),
             "--gpu-id",            self.gpu_id,
-            "--class-ids",         class_ids_str,   # CL addition in recover_cl.py
+            "--class-ids",         class_ids_str,
             "--store-best-images",
         ]
 
