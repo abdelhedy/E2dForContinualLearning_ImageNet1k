@@ -1,0 +1,20 @@
+# Virtual environment
+e2d_env/
+
+# Training output (synthetic images, soft labels, checkpoints)
+e2d_cl_output/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# BN/Conv statistics cache (large, regeneratable)
+BNFeatureHook/
+ConvFeatureHook/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

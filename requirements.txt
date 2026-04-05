@@ -1,0 +1,18 @@
+# PyTorch with CUDA 12.4 support (compatible with CUDA 12.7 driver)
+# Step 1: pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+# Step 2: pip install -r requirements.txt
+# Step 3: pip uninstall -y qpax jax jaxlib jaxopt  (removes JAX circular import issue)
+
+# Continual learning framework
+# Note: pytorchcv must be pinned to 0.0.67 (0.0.74 breaks avalanche's MobileNet import)
+avalanche-lib==0.5.0
+pytorchcv==0.0.67
+
+# Image processing
+Pillow>=9.0.0
+
+# Numerical operations
+numpy>=1.23.0
+
+# Progress bars
+tqdm>=4.64.0
