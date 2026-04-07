@@ -170,6 +170,20 @@ class BNFeatureHook():
         """
         self.targets = targets
 
+    def _stack_category_lists(self):
+        """Stack per-class lists into tensors after save(), filling unseen classes with zeros."""
+        ref = next((v for v in self.category_running_dd_var_list if isinstance(v, torch.Tensor)), None)
+        if ref is None:
+            return
+        device = ref.device
+        for i in range(len(self.category_running_dd_var_list)):
+            if not isinstance(self.category_running_dd_var_list[i], torch.Tensor):
+                self.category_running_dd_var_list[i] = torch.zeros_like(ref)
+            if not isinstance(self.category_running_dd_mean_list[i], torch.Tensor):
+                self.category_running_dd_mean_list[i] = torch.zeros_like(ref)
+        self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
+        self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
+
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):
             self.close()
@@ -180,6 +194,8 @@ class BNFeatureHook():
 
     def save(self):
         for i, category_save_path in enumerate(self.category_save_path_list):
+            if self.counter[i] == 0:
+                continue
             self.category_running_dd_mean_list[i] = self.category_running_dd_mean_list[i]/self.counter[i]
             self.category_running_dd_var_list[i] = self.category_running_dd_var_list[i]/self.counter[i]
             npz_file = {"running_dd_var": self.category_running_dd_var_list[i].cpu().numpy() if isinstance(self.category_running_dd_var_list[i],
@@ -187,6 +203,8 @@ class BNFeatureHook():
                         "running_dd_mean": self.category_running_dd_mean_list[i].cpu().numpy() if isinstance(self.category_running_dd_mean_list[i],
                                                                                         torch.Tensor) else self.category_running_dd_mean_list[i]}
             np.savez(category_save_path, **npz_file)
+        # Stack into tensors so post_hook_fn can use tensor indexing
+        self._stack_category_lists()
 
     @torch.no_grad()
     def pre_hook_fn(self, module, input, output):
@@ -348,6 +366,8 @@ class ConvFeatureHook():
         np.savez(self.save_path, **npz_file)
 
         for i, category_save_path in enumerate(self.category_save_path_list):
+            if self.counter[i] == 0:
+                continue
             self.category_running_dd_mean_list[i] = self.category_running_dd_mean_list[i]/self.counter[i]
             self.category_running_dd_var_list[i] = self.category_running_dd_var_list[i]/self.counter[i]
             self.category_running_patch_mean_list[i] = self.category_running_patch_mean_list[i]/self.counter[i]
@@ -361,6 +381,30 @@ class ConvFeatureHook():
                         "running_patch_mean": self.category_running_patch_var_list[i].cpu().numpy() if isinstance(self.category_running_patch_var_list[i],
                                                                                               torch.Tensor) else self.category_running_patch_var_list[i]}
             np.savez(category_save_path, **npz_file)
+        # Stack into tensors so post_hook_fn can use tensor indexing
+        self._stack_category_lists()
+
+    def _stack_category_lists(self):
+        """Stack per-class lists into tensors after save(), filling unseen classes with zeros."""
+        ref = next((v for v in self.category_running_dd_var_list if isinstance(v, torch.Tensor)), None)
+        if ref is None:
+            return
+        for i in range(len(self.category_running_dd_var_list)):
+            if not isinstance(self.category_running_dd_var_list[i], torch.Tensor):
+                self.category_running_dd_var_list[i] = torch.zeros_like(ref)
+            if not isinstance(self.category_running_dd_mean_list[i], torch.Tensor):
+                self.category_running_dd_mean_list[i] = torch.zeros_like(ref)
+        ref_patch = next((v for v in self.category_running_patch_var_list if isinstance(v, torch.Tensor)), None)
+        if ref_patch is not None:
+            for i in range(len(self.category_running_patch_var_list)):
+                if not isinstance(self.category_running_patch_var_list[i], torch.Tensor):
+                    self.category_running_patch_var_list[i] = torch.zeros_like(ref_patch)
+                if not isinstance(self.category_running_patch_mean_list[i], torch.Tensor):
+                    self.category_running_patch_mean_list[i] = torch.zeros_like(ref_patch)
+            self.category_running_patch_var_list = torch.stack(self.category_running_patch_var_list, 0)
+            self.category_running_patch_mean_list = torch.stack(self.category_running_patch_mean_list, 0)
+        self.category_running_dd_var_list = torch.stack(self.category_running_dd_var_list, 0)
+        self.category_running_dd_mean_list = torch.stack(self.category_running_dd_mean_list, 0)
 
     def set_hook(self, pre=True):
         if hasattr(self, "hook"):

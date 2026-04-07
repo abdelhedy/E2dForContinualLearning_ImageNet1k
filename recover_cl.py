@@ -68,8 +68,9 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
     args.gpu = gpu
     print("Use GPU: {} for training".format(args.gpu))
     args.rank = args.rank * ngpus_per_node + gpu
-    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                            world_size=args.world_size, rank=args.rank)
+    if args.world_size > 1:
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
 
     torch.cuda.set_device(args.gpu)
     model_teacher = [_m.cuda(gpu).eval() for _m in model_teacher]
@@ -172,7 +173,7 @@ def main_worker(gpu, ngpus_per_node, args, model_teacher, model_verifier,
         ]
         task_subset = torch.utils.data.Subset(full_dataset, task_indices)
         train_loader = torch.utils.data.DataLoader(
-            task_subset, num_workers=4, batch_size=256,
+            task_subset, num_workers=0, batch_size=256,
             drop_last=False, shuffle=True)
 
         print(f"Computing BN stats on {len(task_subset)} images "
@@ -512,17 +513,26 @@ def main_syn():
     ngpus_per_node   = torch.cuda.device_count()
     args.world_size  = ngpus_per_node * args.world_size
 
-    torch.multiprocessing.set_start_method("spawn")
-    mp.spawn(
-        main_worker,
-        nprocs=ngpus_per_node,
-        args=(
-            ngpus_per_node, args,
+    if ngpus_per_node == 1:
+        # Single-GPU path: call main_worker directly (avoids NCCL/libuv on Windows)
+        main_worker(
+            0, ngpus_per_node, args,
             model_teacher, model_verifier,
             ipc_id_range, args.K, args.loss_threshold, bool(args.AMP),
-            class_ids,      # ← CL addition: passed through to main_worker
-        ),
-    )
+            class_ids,
+        )
+    else:
+        torch.multiprocessing.set_start_method("spawn")
+        mp.spawn(
+            main_worker,
+            nprocs=ngpus_per_node,
+            args=(
+                ngpus_per_node, args,
+                model_teacher, model_verifier,
+                ipc_id_range, args.K, args.loss_threshold, bool(args.AMP),
+                class_ids,
+            ),
+        )
 
 
 if __name__ == "__main__":
