@@ -29,6 +29,7 @@ import argparse
 import time
 import datetime
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -205,8 +206,28 @@ def build_evaluator() -> EvaluationPlugin:
 #  Strategy runner with timing
 # ══════════════════════════════════════════════════════════════════════
 
-def run_strategy(strategy, benchmark, name: str) -> dict:
+def run_strategy(
+    strategy,
+    benchmark,
+    name: str,
+    checkpoint_dir: Optional[Path] = None,
+    resume: bool = False,
+) -> dict:
     print(f"\n{'=' * 65}\n  Strategy: {name}\n{'=' * 65}")
+
+    # ── Resume: reload model + optimizer from last saved checkpoint ───
+    start_exp = 0
+    if resume and checkpoint_dir is not None:
+        ckpt_path = checkpoint_dir / f"{name}_latest.pt"
+        if ckpt_path.exists():
+            ckpt = torch.load(str(ckpt_path), map_location=strategy.model.device
+                              if hasattr(strategy.model, "device") else "cpu")
+            strategy.model.load_state_dict(ckpt["model"])
+            strategy.optimizer.load_state_dict(ckpt["optimizer"])
+            start_exp = int(ckpt["exp_id"]) + 1
+            print(f"[Resume] Loaded checkpoint: exp {ckpt['exp_id']} done → resuming from exp {start_exp}")
+        else:
+            print(f"[Resume] No checkpoint found at {ckpt_path}, starting from scratch.")
 
     t0       = time.time()
     ts_start = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -216,9 +237,25 @@ def run_strategy(strategy, benchmark, name: str) -> dict:
     for experience in benchmark.train_stream:
         exp_id = experience.current_experience
         cls    = experience.classes_in_this_experience
+
+        if exp_id < start_exp:
+            print(f"[Resume] Skipping exp {exp_id} (already completed)")
+            continue
+
         print(f"\n--- Exp {exp_id} | classes {cls} ---")
         strategy.train(experience)
         results.append(strategy.eval(benchmark.test_stream))
+
+        # ── Save checkpoint after each experience ─────────────────────
+        if checkpoint_dir is not None:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = checkpoint_dir / f"{name}_latest.pt"
+            torch.save({
+                "exp_id":    exp_id,
+                "model":     strategy.model.state_dict(),
+                "optimizer": strategy.optimizer.state_dict(),
+            }, str(ckpt_path))
+            print(f"[Checkpoint] Saved after exp {exp_id} → {ckpt_path}")
 
     elapsed  = time.time() - t0
     ts_end   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -271,6 +308,10 @@ def main():
     parser.add_argument("--output-dir",    type=str, default="./e2d_cl_output",
                         help="Root for synthetic images and per-task soft labels")
     parser.add_argument("--recover-script",type=str, default="./recover_cl.py")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Directory to save/load checkpoints. Defaults to {output-dir}/checkpoints")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from the latest checkpoint")
 
     # ── CL scenario ──────────────────────────────────────────────────
     parser.add_argument("--n-experiences", type=int, default=10)
@@ -362,6 +403,8 @@ def main():
     print(f"Experiences  : {args.n_experiences}  ({num_classes // args.n_experiences} classes each)")
     print(f"IPC          : {args.ipc}  |  fixed-per-class: {args.fixed_per_class}")
 
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else Path(args.output_dir) / "checkpoints"
+
     common_plugins = [CosineLRPlugin(total_epochs=args.epochs)]
     results_table  = []
 
@@ -381,7 +424,8 @@ def main():
             evaluator=build_evaluator(),
             plugins=list(common_plugins) + [ReplayPlugin(mem_size=mem_size)],
         )
-        results_table.append(run_strategy(strategy, benchmark, "RandomReplay"))
+        results_table.append(run_strategy(strategy, benchmark, "RandomReplay",
+                                          checkpoint_dir=checkpoint_dir, resume=args.resume))
 
     # ── Strategy 2: E2D Replay ────────────────────────────────────────
     if args.strategy in ("all", "e2d"):
@@ -423,7 +467,8 @@ def main():
             evaluator=build_evaluator(),
             plugins=list(common_plugins) + [e2d_plugin],
         )
-        results_table.append(run_strategy(strategy, benchmark, "E2DReplay"))
+        results_table.append(run_strategy(strategy, benchmark, "E2DReplay",
+                                          checkpoint_dir=checkpoint_dir, resume=args.resume))
 
     # ── Summary table ─────────────────────────────────────────────────
     if results_table:

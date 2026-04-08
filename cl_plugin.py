@@ -339,6 +339,11 @@ class E2DReplayPlugin(SupervisedPlugin):
         self.seen_classes: Set[int] = set()
         self._teachers: Optional[List[nn.Module]] = None
 
+        # Resume support: reload buffer state from a previous run
+        if self.buffer.load_index():
+            self.seen_classes = set(self.buffer._data.keys())
+            print(f"[E2DPlugin] Resumed buffer: {len(self.seen_classes)} classes already distilled.")
+
     # ── teacher management ────────────────────────────────────────────
 
     def _load_teachers(self) -> None:
@@ -499,9 +504,16 @@ class E2DReplayPlugin(SupervisedPlugin):
         print(f"\n[E2DPlugin] Task {task_id} | new classes: {new_cls} | seen: {total}")
 
         # ── Stage 1: Recover ─────────────────────────────────────────
-        # Free teacher + student GPU memory, then spawn recover subprocess
+        # Free teacher + student + optimizer GPU memory before subprocess
         self._unload_teachers()
         strategy.model.cpu()
+        # Move optimizer momentum buffers to CPU
+        for state in strategy.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cpu()
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
 
         try:
