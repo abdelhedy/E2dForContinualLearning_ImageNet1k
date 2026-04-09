@@ -404,6 +404,15 @@ class E2DReplayPlugin(SupervisedPlugin):
         result = subprocess.run(cmd, check=True, text=True)
         elapsed = time.time() - t0
         print(f"[E2DPlugin] Recover done in {elapsed:.1f}s")
+
+        # Delete statistic directory immediately — it is only needed during recover
+        # and can be several GB per task, quickly exhausting Kaggle's disk quota.
+        import shutil
+        stat_path = Path(task_statistic_path)
+        if stat_path.exists():
+            shutil.rmtree(str(stat_path))
+            print(f"[E2DPlugin] Deleted statistic cache: {stat_path}")
+
         return syn_root
 
     # ── image path collection ─────────────────────────────────────────
@@ -506,7 +515,9 @@ class E2DReplayPlugin(SupervisedPlugin):
         # ── Stage 1: Recover ─────────────────────────────────────────
         # Free teacher + student + optimizer GPU memory before subprocess
         self._unload_teachers()
-        strategy.model.cpu()
+        # Unwrap DataParallel if present so .cpu()/.to() work correctly
+        _raw_model = strategy.model.module if isinstance(strategy.model, nn.DataParallel) else strategy.model
+        _raw_model.cpu()
         # Move optimizer momentum buffers to CPU
         for state in strategy.optimizer.state.values():
             for k, v in state.items():
@@ -519,8 +530,12 @@ class E2DReplayPlugin(SupervisedPlugin):
         try:
             syn_dir = self._run_recover(task_id, new_cls)
         finally:
-            # Restore student to device regardless of recover success
-            strategy.model.to(self.device)
+            # Restore student and optimizer state to device regardless of recover success
+            _raw_model.to(self.device)
+            for state in strategy.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
 
         paths_per_class = self._collect_img_paths(syn_dir, new_cls)
 

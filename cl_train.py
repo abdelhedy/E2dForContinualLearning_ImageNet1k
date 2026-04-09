@@ -56,21 +56,26 @@ from cl_plugin import E2DReplayPlugin
 # ══════════════════════════════════════════════════════════════════════
 
 class CosineLRPlugin(SupervisedPlugin):
-    def __init__(self, total_epochs: int, eta_min: float = 0.0):
+    def __init__(self, total_epochs: int, initial_lr: float, eta_min: float = 0.0):
         super().__init__()
         self.total_epochs = int(total_epochs)
         self.eta_min      = float(eta_min)
+        self._initial_lr  = float(initial_lr)
         self.scheduler    = None
 
     def before_training_exp(self, strategy, **kwargs) -> None:
+        # Always reset LR to initial value — handles resume where optimizer
+        # is loaded with LR=0 from the end of the previous experience.
+        for pg in strategy.optimizer.param_groups:
+            pg["lr"] = self._initial_lr
+
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             strategy.optimizer,
             T_max=self.total_epochs,
             eta_min=self.eta_min,
         )
-        lr     = strategy.optimizer.param_groups[0]["lr"]
         exp_id = strategy.experience.current_experience
-        print(f"[CosineLR] Exp {exp_id} | start lr={lr:.6f} | T_max={self.total_epochs}")
+        print(f"[CosineLR] Exp {exp_id} | start lr={self._initial_lr:.6f} | T_max={self.total_epochs}")
 
     def after_training_epoch(self, strategy, **kwargs) -> None:
         if self.scheduler is not None:
@@ -83,7 +88,8 @@ class CosineLRPlugin(SupervisedPlugin):
 #  Benchmark builders
 # ══════════════════════════════════════════════════════════════════════
 
-def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int):
+def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int,
+                         n_classes: Optional[int] = None):
     """
     Split ImageNet-1K (1000 classes, 224×224) using Avalanche's nc_benchmark.
 
@@ -117,6 +123,7 @@ def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int):
     train_ds = ImageNet(root=imagenet_path, split="train", transform=train_tf)
     val_ds   = ImageNet(root=imagenet_path, split="val",   transform=val_tf)
 
+    total_classes = n_classes if n_classes is not None else 1000
     benchmark = nc_benchmark(
         train_dataset=train_ds,
         test_dataset=val_ds,
@@ -124,12 +131,14 @@ def build_split_imagenet(imagenet_path: str, n_experiences: int, seed: int):
         shuffle=False,   # deterministic class split keeps class→task mapping stable
         seed=seed,
         task_labels=False,
+        fixed_class_order=list(range(total_classes)),
     )
-    return benchmark, 1000, 224
+    return benchmark, total_classes, 224
 
 
 def build_split_tiny_imagenet(n_experiences: int, seed: int,
-                               dataset_root: str = "~/.avalanche/data"):
+                               dataset_root: str = "~/.avalanche/data",
+                               n_classes: Optional[int] = None):
     """
     Split Tiny-ImageNet (200 classes, 64×64).
     Avalanche downloads and extracts it automatically on first run (~240 MB).
@@ -143,14 +152,16 @@ def build_split_tiny_imagenet(n_experiences: int, seed: int,
             "Upgrade avalanche-lib: pip install -U avalanche-lib"
         )
 
+    total_classes = n_classes if n_classes is not None else 200
     benchmark = SplitTinyImageNet(
         n_experiences=n_experiences,
         seed=seed,
         dataset_root=str(Path(dataset_root).expanduser()),
         return_task_id=False,
         shuffle=True,
+        fixed_class_order=list(range(total_classes)),
     )
-    return benchmark, 200, 64
+    return benchmark, total_classes, 64
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -315,6 +326,9 @@ def main():
 
     # ── CL scenario ──────────────────────────────────────────────────
     parser.add_argument("--n-experiences", type=int, default=10)
+    parser.add_argument("--n-classes",     type=int, default=100,
+                        help="Number of classes to use (subset). "
+                             "Max 200 for --dataset tiny, 1000 for imagenet.")
     parser.add_argument("--seed",          type=int, default=42)
 
     # ── Student ──────────────────────────────────────────────────────
@@ -384,12 +398,14 @@ def main():
     # ── Build benchmark ───────────────────────────────────────────────
     if args.dataset == "imagenet":
         benchmark, num_classes, img_size = build_split_imagenet(
-            args.imagenet_path, args.n_experiences, args.seed
+            args.imagenet_path, args.n_experiences, args.seed,
+            n_classes=args.n_classes,
         )
         train_data_path = str(Path(args.imagenet_path) / "train")
     else:
         benchmark, num_classes, img_size = build_split_tiny_imagenet(
-            args.n_experiences, args.seed, args.tiny_data_root
+            args.n_experiences, args.seed, args.tiny_data_root,
+            n_classes=args.n_classes,
         )
         # recover_cl.py reads real images from here for BN stats
         train_data_path = str(
@@ -397,21 +413,24 @@ def main():
             / "tiny-imagenet-200" / "train"
         )
 
+    n_gpus = torch.cuda.device_count() if not args.no_cuda else 0
     print(f"Dataset      : {args.dataset}  ({num_classes} classes, {img_size}×{img_size})")
-    print(f"Device       : {device}")
+    print(f"Device       : {device}  ({n_gpus} GPU(s) available)")
     print(f"Student arch : {args.student_arch}")
     print(f"Experiences  : {args.n_experiences}  ({num_classes // args.n_experiences} classes each)")
     print(f"IPC          : {args.ipc}  |  fixed-per-class: {args.fixed_per_class}")
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else Path(args.output_dir) / "checkpoints"
 
-    common_plugins = [CosineLRPlugin(total_epochs=args.epochs)]
+    common_plugins = [CosineLRPlugin(total_epochs=args.epochs, initial_lr=args.lr)]
     results_table  = []
 
     # ── Strategy 1: Random Replay ─────────────────────────────────────
     if args.strategy in ("all", "random"):
         mem_size  = args.ipc * num_classes if args.fixed_per_class else args.ipc
         model     = build_student(args.student_arch, num_classes, img_size).to(device)
+        if n_gpus > 1:
+            model = nn.DataParallel(model)
         optimizer = make_optimizer(model, args)
         strategy  = Naive(
             model=model,
@@ -455,6 +474,8 @@ def main():
             kd_temperature=args.kd_temperature,
         )
         model     = build_student(args.student_arch, num_classes, img_size).to(device)
+        if n_gpus > 1:
+            model = nn.DataParallel(model)
         optimizer = make_optimizer(model, args)
         strategy  = Naive(
             model=model,

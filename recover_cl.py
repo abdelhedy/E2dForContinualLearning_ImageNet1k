@@ -522,7 +522,7 @@ def main_syn():
             class_ids,
         )
     else:
-        torch.multiprocessing.set_start_method("spawn")
+        torch.multiprocessing.set_start_method("spawn", force=True)
         mp.spawn(
             main_worker,
             nprocs=ngpus_per_node,
